@@ -4,7 +4,6 @@ namespace App\Http\Controllers;
 
 use App\Models\Angsuran;
 use App\Models\PembayaranAngsuran;
-use App\Models\Pinjaman;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -13,50 +12,64 @@ use Illuminate\Validation\ValidationException;
 class AngsuranController extends Controller
 {
     /**
-     * Daftar angsuran.
+     * Menampilkan daftar angsuran.
      */
-    public function index(Request $request)
+    public function index()
     {
-        $query = Angsuran::with('pinjaman.anggota')
-            ->latest('jatuh_tempo');
+        // Semua data: dipakai hanya untuk menghitung ringkasan
+        $semuaAngsuran = Angsuran::with([
+            'pinjaman.anggota',
+            'pembayarans',
+        ])->orderBy('jatuh_tempo')->get();
 
-        if ($request->filled('status')) {
-            $query->where('status', $request->status);
-        }
+        $totalTagihan = $semuaAngsuran->sum('total_tagihan');
+        $totalDibayar = $semuaAngsuran->sum('total_dibayar');
+        $sisaPiutang = max(0, $totalTagihan - $totalDibayar);
 
-        if ($request->filled('search')) {
-            $keyword = $request->search;
+        $jumlahAngsuran = $semuaAngsuran->count();
 
-            $query->whereHas('pinjaman.anggota', function ($q) use ($keyword) {
-                $q->where('nama', 'like', "%{$keyword}%");
-            });
-        }
+        // Menghitung status angsuran
+        $jumlahLunas = $semuaAngsuran->where('status', 'lunas')->count();
 
-        $angsurans = $query->paginate(10)->withQueryString();
+        $belumBayar = $semuaAngsuran->filter(function ($angsuran) {
+            return (float) $angsuran->total_dibayar <= 0;
+        })->count();
 
-        $totalTagihan = Angsuran::sum('total_tagihan');
-        $totalDibayar = Angsuran::sum('total_dibayar');
-        $belumBayar = Angsuran::where('status', 'belum_bayar')->count();
-        $sebagian = Angsuran::where('status', 'sebagian')->count();
-        $lunas = Angsuran::where('status', 'lunas')->count();
+        $sebagian = $semuaAngsuran->filter(function ($angsuran) {
+            return (float) $angsuran->total_dibayar > 0
+                && $angsuran->status !== 'lunas';
+        })->count();
 
-        $tunggakan = Angsuran::whereDate('jatuh_tempo', '<', today())
-            ->whereIn('status', ['belum_bayar', 'sebagian'])
-            ->count();
+        $tunggakan = $semuaAngsuran->filter(function ($angsuran) {
+            return $angsuran->status !== 'lunas'
+                && $angsuran->jatuh_tempo
+                && $angsuran->jatuh_tempo->isPast();
+        })->count();
+
+        // Data untuk tabel: dipaginasi supaya $angsurans->links() bisa dipakai
+        $angsurans = Angsuran::with([
+            'pinjaman.anggota',
+            'pembayarans',
+        ])
+            ->orderBy('jatuh_tempo')
+            ->paginate(10)
+            ->withQueryString();
 
         return view('angsuran.index', compact(
             'angsurans',
             'totalTagihan',
             'totalDibayar',
+            'sisaPiutang',
+            'jumlahAngsuran',
+            'jumlahLunas',
             'belumBayar',
             'sebagian',
-            'lunas',
             'tunggakan'
         ));
     }
 
     /**
-     * Detail angsuran dan riwayat pembayaran.
+     * Menampilkan detail angsuran.
      */
     public function show(Angsuran $angsuran)
     {
@@ -65,90 +78,148 @@ class AngsuranController extends Controller
             'pembayarans.petugas',
         ]);
 
-        return view('angsuran.show', compact('angsuran'));
+        return view('angsuran.show', [
+            'angsuran' => $angsuran,
+        ]);
     }
 
     /**
-     * Menyimpan pembayaran angsuran.
+     * Memproses pembayaran angsuran.
      */
     public function pay(Request $request, Angsuran $angsuran)
     {
         $validated = $request->validate([
-            'jumlah_bayar' => 'required|numeric|min:0.01',
-            'tanggal_bayar' => 'required|date|before_or_equal:today',
-            'keterangan' => 'nullable|string|max:1000',
+            'jumlah_bayar' => [
+                'required',
+                'numeric',
+                'min:0.01',
+            ],
+
+            'tanggal_bayar' => [
+                'required',
+                'date',
+            ],
+
+            'keterangan' => [
+                'nullable',
+                'string',
+                'max:255',
+            ],
         ]);
 
-        DB::transaction(function () use ($angsuran, $validated) {
-
+        DB::transaction(function () use (
+            $validated,
+            $angsuran,
+            $request
+        ) {
+            // Mengunci data angsuran selama pembayaran
             $data = Angsuran::whereKey($angsuran->id)
                 ->lockForUpdate()
                 ->firstOrFail();
 
-            $pinjaman = Pinjaman::whereKey($data->pinjaman_id)
-                ->lockForUpdate()
-                ->firstOrFail();
+            // Konversi pembayaran ke satuan sen
+            $pembayaran = (int) round(
+                (float) $validated['jumlah_bayar'] * 100
+            );
 
-            if ($pinjaman->status !== 'dicairkan') {
+            // Menghitung total tagihan
+            $totalTagihan = (int) round(
+                (float) $data->total_tagihan * 100
+            );
+
+            // Menghitung total yang sudah dibayar
+            $totalSudahDibayar = (int) round(
+                (float) $data->total_dibayar * 100
+            );
+
+            // Menghitung sisa tagihan
+            $sisaTagihan = max(
+                0,
+                $totalTagihan - $totalSudahDibayar
+            );
+
+            // Memeriksa pembayaran
+            if ($pembayaran > $sisaTagihan) {
                 throw ValidationException::withMessages([
-                    'angsuran' => 'Pinjaman tidak dalam status dapat diangsur.',
+                    'jumlah_bayar' =>
+                        'Pembayaran melebihi sisa tagihan.',
                 ]);
             }
 
-            if ($data->status === 'lunas') {
-                throw ValidationException::withMessages([
-                    'angsuran' => 'Angsuran ini sudah lunas.',
-                ]);
-            }
+            // Menghitung bunga yang sudah dibayar
+            $bungaSudahDibayar = (int) round(
+                (float) $data->pembayarans()
+                    ->sum('bunga_dibayar') * 100
+            );
 
-            // Konversi ke satuan sen
-            $tagihan = (int) round((float) $data->total_tagihan * 100);
-            $sudahDibayar = (int) round((float) $data->total_dibayar * 100);
-            $pembayaran = (int) round((float) $validated['jumlah_bayar'] * 100);
+            // Menghitung total bunga tagihan
+            $bungaTagihan = (int) round(
+                (float) $data->bunga * 100
+            );
 
-            $sisa = $tagihan - $sudahDibayar;
+            // Menghitung sisa bunga
+            $sisaBunga = max(
+                0,
+                $bungaTagihan - $bungaSudahDibayar
+            );
 
-            if ($pembayaran <= 0 || $pembayaran > $sisa) {
-                throw ValidationException::withMessages([
-                    'jumlah_bayar' => 'Jumlah pembayaran melebihi sisa tagihan.',
-                ]);
-            }
+            // Menghitung pembayaran bunga
+            $pembayaranBunga = min(
+                $pembayaran,
+                $sisaBunga
+            );
 
-            // Simpan transaksi pembayaran
+            // Menghitung pembayaran pokok
+            $pembayaranPokok = $pembayaran
+                - $pembayaranBunga;
+
+            // Konversi kembali ke desimal
+            $jumlahBayarDecimal = $pembayaran / 100;
+            $bungaDecimal = $pembayaranBunga / 100;
+            $pokokDecimal = $pembayaranPokok / 100;
+
+            // Menyimpan pembayaran
             PembayaranAngsuran::create([
                 'angsuran_id' => $data->id,
-                'kode_pembayaran' => 'BYR-' . strtoupper((string) Str::uuid()),
+
+                'kode_pembayaran' => 'BYR-'
+                    . now()->format('YmdHis')
+                    . '-'
+                    . strtoupper(Str::random(4)),
+
                 'tanggal_bayar' => $validated['tanggal_bayar'],
-                'jumlah_bayar' => $pembayaran / 100,
-                'dibayar_oleh' => auth()->id(),
+
+                'jumlah_bayar' => $jumlahBayarDecimal,
+
+                'dibayar_oleh' => $request->user()->id,
+
                 'keterangan' => $validated['keterangan'] ?? null,
+
+                'pokok_dibayar' => $pokokDecimal,
+
+                'bunga_dibayar' => $bungaDecimal,
             ]);
 
-            $totalBaru = $sudahDibayar + $pembayaran;
-            $lunas = $totalBaru >= $tagihan;
+            // Memperbarui total pembayaran
+            $totalDibayarBaru = $totalSudahDibayar
+                + $pembayaran;
 
-            // Update status angsuran
-            $data->update([
-                'total_dibayar' => $totalBaru / 100,
-                'status' => $lunas ? 'lunas' : 'sebagian',
-                'paid_at' => $lunas ? now() : null,
-            ]);
+            $data->total_dibayar = $totalDibayarBaru / 100;
 
-            // Jika semua angsuran sudah lunas, pinjaman ikut lunas
-            $masihAdaSisa = Angsuran::where('pinjaman_id', $pinjaman->id)
-                ->where('status', '!=', 'lunas')
-                ->exists();
-
-            if (! $masihAdaSisa) {
-                $pinjaman->update([
-                    'status' => 'lunas',
-                    'lunas_at' => now(),
-                ]);
+            // Memperbarui status angsuran
+            if ($totalDibayarBaru >= $totalTagihan) {
+                $data->status = 'lunas';
+                $data->paid_at = now();
             }
+
+            $data->save();
         });
 
         return redirect()
             ->route('angsuran.show', $angsuran->id)
-            ->with('success', 'Pembayaran angsuran berhasil disimpan.');
+            ->with(
+                'success',
+                'Pembayaran angsuran berhasil disimpan.'
+            );
     }
 }

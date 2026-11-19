@@ -1,7 +1,9 @@
+
 <?php
 
 use App\Http\Controllers\AnggotaController;
 use App\Http\Controllers\AngsuranController;
+use App\Http\Controllers\LaporanController;
 use App\Http\Controllers\SimpananController;
 use App\Http\Controllers\UserController;
 use App\Http\Controllers\PinjamanController;
@@ -14,10 +16,12 @@ Route::get('/', function () {
 
 Route::middleware('auth')->group(function () {
 
+    // ===== DASHBOARD =====
     Route::get('/dashboard', function () {
         return view('dashboard');
     })->name('dashboard');
 
+    // ===== ANGGOTA =====
     Route::resource('anggotas', AnggotaController::class);
 
     // ===== PINJAMAN =====
@@ -60,9 +64,36 @@ Route::middleware('auth')->group(function () {
     // ===== SIMPANAN =====
     Route::resource('simpanans', SimpananController::class);
 
-    // ===== USER (khusus admin) =====
+    // ===== LAPORAN =====
+
+    // Laporan pinjaman
+    Route::get('/laporan/pinjaman', [
+        LaporanController::class,
+        'index'
+    ])->name('laporan.pinjaman');
+
+    // Cetak laporan PDF
+    Route::get('/laporan/pinjaman/pdf', [
+        LaporanController::class,
+        'cetakLaporan'
+    ])->name('laporan.pinjaman.pdf');
+
+    // Cetak kartu angsuran
+    Route::get('/laporan/kartu-angsuran/{pinjaman}', [
+        LaporanController::class,
+        'kartuAngsuran'
+    ])->name('laporan.kartu');
+
+    // Cetak kwitansi
+    Route::get('/laporan/kwitansi/{pembayaran}', [
+        LaporanController::class,
+        'kwitansi'
+    ])->name('laporan.kwitansi');
+
+    // ===== USER (KHUSUS ADMIN) =====
     Route::middleware(RoleMiddleware::class . ':admin')->group(function () {
-        Route::resource('users', UserController::class)->only(['index', 'update']);
+        Route::resource('users', UserController::class)
+            ->only(['index', 'update']);
     });
 });
 
